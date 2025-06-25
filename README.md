@@ -149,4 +149,10 @@ To modify or extend the functionality:
 
 ## License
 
-This project is open source. Please respect website terms of service and robots.txt when scraping.
+This project is licensed under MIT License. You can check it out at - [LICENSE](/LICENSE)
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+
