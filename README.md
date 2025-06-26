@@ -1,4 +1,5 @@
 # Web Search MCP
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/pranavms13/web-search-mcp)
 
 A Model Context Protocol (MCP) server that provides web search functionality using a headless Chrome browser to scrape Google search results.
 
