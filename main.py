@@ -2,14 +2,14 @@
 """
 MCP Web Search Server
 A Model Context Protocol server that provides web search functionality using a headless browser
-to scrape Google search results.
+to scrape search results from multiple search engines with fallback support.
 """
 
 import asyncio
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus, urljoin, urlparse
 
 from selenium import webdriver
@@ -33,17 +33,24 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP("Web Search MCP")
 
 class WebSearcher:
-    """Web search functionality using headless Chrome browser."""
+    """Web search functionality using headless Chrome browser with fallback support."""
     
     def __init__(self):
         self.driver: Optional[webdriver.Chrome] = None
         self.driver_initialized = False
+        # Define search engines in order of preference
+        self.search_engines = [
+            {'name': 'google', 'method': self._search_google},
+            {'name': 'duckduckgo', 'method': self._search_duckduckgo},
+            {'name': 'bing', 'method': self._search_bing}
+        ]
+        self.blocked_engines = set()  # Track which engines are blocked/failing
     
     def _setup_driver(self):
         """Set up Chrome driver with headless options."""
         try:
             chrome_options = Options()
-            chrome_options.add_argument("--headless")
+            # chrome_options.add_argument("--headless")
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
             chrome_options.add_argument("--disable-gpu")
@@ -61,9 +68,9 @@ class WebSearcher:
             logger.error(f"Failed to initialize Chrome driver: {e}")
             raise
     
-    def search_google(self, query: str, max_results: int = 10, include_snippets: bool = True) -> List[Dict[str, Any]]:
+    def search_with_fallback(self, query: str, max_results: int = 10, include_snippets: bool = True) -> Tuple[List[Dict[str, Any]], str]:
         """
-        Search Google and return results.
+        Search using multiple search engines with fallback support.
         
         Args:
             query: Search query string
@@ -71,59 +78,136 @@ class WebSearcher:
             include_snippets: Whether to include text snippets from search results
             
         Returns:
-            List of search result dictionaries
+            Tuple of (search results list, engine name used)
         """
         if not self.driver_initialized or self.driver is None:
             self._setup_driver()
         
         if self.driver is None:
             logger.error("Failed to initialize Chrome driver")
-            return []
+            return [], "none"
         
+        # Try each search engine until one works
+        for engine in self.search_engines:
+            engine_name = engine['name']
+            
+            # Skip if this engine is known to be blocked
+            if engine_name in self.blocked_engines:
+                logger.info(f"Skipping {engine_name} (previously blocked)")
+                continue
+            
+            try:
+                logger.info(f"Trying search with {engine_name}")
+                results = engine['method'](query, max_results, include_snippets)
+                
+                if results:  # If we got results, success!
+                    logger.info(f"Successfully searched with {engine_name}, got {len(results)} results")
+                    # Remove from blocked list if it was there (in case it recovered)
+                    self.blocked_engines.discard(engine_name)
+                    return results, engine_name
+                else:
+                    logger.warning(f"No results from {engine_name}")
+                    
+            except Exception as e:
+                logger.error(f"Error with {engine_name}: {e}")
+                # Add to blocked list for this session
+                self.blocked_engines.add(engine_name)
+                continue
+        
+        logger.error("All search engines failed or are blocked")
+        return [], "none"
+    
+    def _search_google(self, query: str, max_results: int, include_snippets: bool) -> List[Dict[str, Any]]:
+        """Search Google (original implementation)."""
+        if self.driver is None:
+            raise Exception("Driver not initialized")
+            
         try:
             # Construct Google search URL
             search_url = f"https://www.google.com/search?q={quote_plus(query)}&num={min(max_results, 100)}"
             
-            logger.info(f"Searching Google for: {query}")
             self.driver.get(search_url)
             
-            # Wait for results to load with increased timeout
-            time.sleep(2)  # Give the page time to load
+            # Wait for results to load
+            time.sleep(2)
             wait = WebDriverWait(self.driver, 15)
             wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div#search, div#rso")))
             
-            # Parse results using XPath
-            results = self._parse_search_results_xpath(max_results, include_snippets)
+            # Check if we're blocked (captcha, unusual traffic page, etc.)
+            if self._is_google_blocked():
+                raise Exception("Google has blocked this IP/session")
             
-            logger.info(f"Found {len(results)} search results")
-            return results
+            return self._parse_google_results(max_results, include_snippets)
             
-        except TimeoutException:
-            logger.error("Timeout waiting for search results to load")
-            return []
-        except WebDriverException as e:
-            logger.error(f"WebDriver error during search: {e}")
-            return []
         except Exception as e:
-            logger.error(f"Unexpected error during search: {e}")
-            return []
+            logger.error(f"Google search failed: {e}")
+            raise
     
-    def _parse_search_results_xpath(self, max_results: int, include_snippets: bool) -> List[Dict[str, Any]]:
-        """Parse Google search results using XPath selectors."""
+    def _search_duckduckgo(self, query: str, max_results: int, include_snippets: bool) -> List[Dict[str, Any]]:
+        """Search DuckDuckGo as fallback."""
+        if self.driver is None:
+            raise Exception("Driver not initialized")
+            
+        try:
+            # DuckDuckGo search URL
+            search_url = f"https://duckduckgo.com/?q={quote_plus(query)}"
+            
+            self.driver.get(search_url)
+            time.sleep(3)  # DuckDuckGo needs a bit more time to load
+            
+            return self._parse_duckduckgo_results(max_results, include_snippets)
+            
+        except Exception as e:
+            logger.error(f"DuckDuckGo search failed: {e}")
+            raise
+    
+    def _search_bing(self, query: str, max_results: int, include_snippets: bool) -> List[Dict[str, Any]]:
+        """Search Bing as fallback."""
+        if self.driver is None:
+            raise Exception("Driver not initialized")
+            
+        try:
+            # Bing search URL
+            search_url = f"https://www.bing.com/search?q={quote_plus(query)}"
+            
+            self.driver.get(search_url)
+            time.sleep(2)
+            
+            return self._parse_bing_results(max_results, include_snippets)
+            
+        except Exception as e:
+            logger.error(f"Bing search failed: {e}")
+            raise
+    
+    def _is_google_blocked(self) -> bool:
+        """Check if Google has blocked us with captcha or unusual traffic page."""
+        if self.driver is None:
+            return True
+        try:
+            page_source = self.driver.page_source.lower()
+            blocked_indicators = [
+                "unusual traffic",
+                "captcha",
+                "blocked",
+                "verify you're not a robot",
+                "our systems have detected unusual traffic"
+            ]
+            return any(indicator in page_source for indicator in blocked_indicators)
+        except:
+            return False
+    
+    def _parse_google_results(self, max_results: int, include_snippets: bool) -> List[Dict[str, Any]]:
+        """Parse Google search results (original implementation)."""
         results = []
         
         if self.driver is None:
-            logger.error("Driver is not initialized")
             return results
         
         try:
-            # Find all search result containers using a more flexible XPath
-            # Look for div elements with class 'g' which contain search results
             result_containers = self.driver.find_elements(By.XPATH, "//div[@class='g' or contains(@class, 'g ')]")
             
             for i, container in enumerate(result_containers[:max_results]):
                 try:
-                    # Extract title using XPath - look for h3 elements within the container
                     title_elements = container.find_elements(By.XPATH, ".//h3")
                     if not title_elements:
                         continue
@@ -132,10 +216,8 @@ class WebSearcher:
                     if not title:
                         continue
                     
-                    # Extract URL - look for the parent anchor tag of the h3
                     link_elements = container.find_elements(By.XPATH, ".//h3/parent::a | .//h3/ancestor::a")
                     if not link_elements:
-                        # Try alternative: look for any anchor with href in the container
                         link_elements = container.find_elements(By.XPATH, ".//a[@href]")
                     
                     if not link_elements:
@@ -145,14 +227,11 @@ class WebSearcher:
                     if not url or url.startswith('/search') or url.startswith('#'):
                         continue
                     
-                    # Clean up URL (Google sometimes wraps URLs)
                     if url.startswith('/url?q='):
                         url = url.split('/url?q=')[1].split('&')[0]
                     
-                    # Extract snippet if requested
                     snippet = ""
                     if include_snippets:
-                        # Look for snippet text in various possible locations
                         snippet_xpaths = [
                             ".//span[contains(@class, 'aCOpRe')]",
                             ".//div[contains(@class, 'VwiC3b')]",
@@ -165,31 +244,141 @@ class WebSearcher:
                             snippet_elements = container.find_elements(By.XPATH, xpath)
                             if snippet_elements:
                                 snippet_text = snippet_elements[0].text.strip()
-                                if len(snippet_text) > 20:  # Only use if it's substantial text
+                                if len(snippet_text) > 20:
                                     snippet = snippet_text
                                     break
                     
-                    # Extract domain
                     domain = urlparse(url).netloc
                     
-                    result_dict = {
+                    results.append({
                         "title": title,
                         "url": url,
                         "domain": domain,
                         "snippet": snippet,
-                        "rank": i + 1
-                    }
-                    
-                    results.append(result_dict)
+                        "rank": i + 1,
+                        "source_engine": "google"
+                    })
                     
                 except Exception as e:
-                    logger.warning(f"Error parsing search result {i}: {e}")
+                    logger.warning(f"Error parsing Google result {i}: {e}")
                     continue
             
         except Exception as e:
-            logger.error(f"Error finding search results: {e}")
+            logger.error(f"Error parsing Google results: {e}")
         
         return results
+    
+    def _parse_duckduckgo_results(self, max_results: int, include_snippets: bool) -> List[Dict[str, Any]]:
+        """Parse DuckDuckGo search results."""
+        results = []
+        
+        if self.driver is None:
+            return results
+        
+        try:
+            # DuckDuckGo uses different selectors
+            result_containers = self.driver.find_elements(By.CSS_SELECTOR, "article[data-testid='result'], div[data-testid='result']")
+            
+            for i, container in enumerate(result_containers[:max_results]):
+                try:
+                    # Title
+                    title_elements = container.find_elements(By.CSS_SELECTOR, "h2 a, h3 a")
+                    if not title_elements:
+                        continue
+                    
+                    title = title_elements[0].text.strip()
+                    url = title_elements[0].get_attribute('href')
+                    
+                    if not title or not url:
+                        continue
+                    
+                    # Snippet
+                    snippet = ""
+                    if include_snippets:
+                        snippet_elements = container.find_elements(By.CSS_SELECTOR, "[data-result='snippet'], .result__snippet")
+                        if snippet_elements:
+                            snippet = snippet_elements[0].text.strip()
+                    
+                    domain = urlparse(url).netloc
+                    
+                    results.append({
+                        "title": title,
+                        "url": url,
+                        "domain": domain,
+                        "snippet": snippet,
+                        "rank": i + 1,
+                        "source_engine": "duckduckgo"
+                    })
+                    
+                except Exception as e:
+                    logger.warning(f"Error parsing DuckDuckGo result {i}: {e}")
+                    continue
+            
+        except Exception as e:
+            logger.error(f"Error parsing DuckDuckGo results: {e}")
+        
+        return results
+    
+    def _parse_bing_results(self, max_results: int, include_snippets: bool) -> List[Dict[str, Any]]:
+        """Parse Bing search results."""
+        results = []
+        
+        if self.driver is None:
+            return results
+        
+        try:
+            # Bing result selectors
+            result_containers = self.driver.find_elements(By.CSS_SELECTOR, ".b_algo")
+            
+            for i, container in enumerate(result_containers[:max_results]):
+                try:
+                    # Title and URL
+                    title_elements = container.find_elements(By.CSS_SELECTOR, "h2 a")
+                    if not title_elements:
+                        continue
+                    
+                    title = title_elements[0].text.strip()
+                    url = title_elements[0].get_attribute('href')
+                    
+                    if not title or not url:
+                        continue
+                    
+                    # Snippet
+                    snippet = ""
+                    if include_snippets:
+                        snippet_elements = container.find_elements(By.CSS_SELECTOR, ".b_caption p")
+                        if snippet_elements:
+                            snippet = snippet_elements[0].text.strip()
+                    
+                    domain = urlparse(url).netloc
+                    
+                    results.append({
+                        "title": title,
+                        "url": url,
+                        "domain": domain,
+                        "snippet": snippet,
+                        "rank": i + 1,
+                        "source_engine": "bing"
+                    })
+                    
+                except Exception as e:
+                    logger.warning(f"Error parsing Bing result {i}: {e}")
+                    continue
+            
+        except Exception as e:
+            logger.error(f"Error parsing Bing results: {e}")
+        
+        return results
+
+    # Keep the old method for backward compatibility
+    def search_google(self, query: str, max_results: int = 10, include_snippets: bool = True) -> List[Dict[str, Any]]:
+        """Legacy method - now uses fallback search."""
+        results, engine_used = self.search_with_fallback(query, max_results, include_snippets)
+        return results
+
+    def _parse_search_results_xpath(self, max_results: int, include_snippets: bool) -> List[Dict[str, Any]]:
+        """Legacy method - redirects to Google parser."""
+        return self._parse_google_results(max_results, include_snippets)
     
     def get_page_content(self, url: str, max_length: int = 5000) -> Dict[str, Any]:
         """
@@ -253,6 +442,19 @@ class WebSearcher:
                 "length": 0
             }
     
+    def reset_blocked_engines(self):
+        """Reset the list of blocked engines (useful for testing or recovery)."""
+        self.blocked_engines.clear()
+        logger.info("Reset blocked engines list")
+    
+    def get_engine_status(self) -> Dict[str, str]:
+        """Get the status of all search engines."""
+        status = {}
+        for engine in self.search_engines:
+            name = engine['name']
+            status[name] = "blocked" if name in self.blocked_engines else "available"
+        return status
+    
     def close(self):
         """Close the browser driver."""
         if self.driver:
@@ -275,7 +477,7 @@ def get_searcher():
 @mcp.tool()
 def search_web(query: str, max_results: int = 10, include_snippets: bool = True) -> List[Dict[str, Any]]:
     """
-    Search the web using Google and return results.
+    Search the web using multiple search engines with automatic fallback.
     
     Args:
         query: The search query string
@@ -283,10 +485,37 @@ def search_web(query: str, max_results: int = 10, include_snippets: bool = True)
         include_snippets: Whether to include text snippets from search results (default: True)
     
     Returns:
-        List of search results, each containing title, URL, domain, snippet, and rank
+        List of search results, each containing title, URL, domain, snippet, rank, and source_engine
     """
     max_results = min(max_results, 100)  # Cap at 100 results
-    return get_searcher().search_google(query, max_results, include_snippets)
+    results, engine_used = get_searcher().search_with_fallback(query, max_results, include_snippets)
+    
+    # Add metadata about which engine was used
+    if results:
+        logger.info(f"Search completed using {engine_used} engine")
+    
+    return results
+
+@mcp.tool()
+def get_search_engine_status() -> Dict[str, str]:
+    """
+    Get the current status of all search engines (available/blocked).
+    
+    Returns:
+        Dictionary with engine names as keys and their status as values
+    """
+    return get_searcher().get_engine_status()
+
+@mcp.tool()
+def reset_search_engines() -> str:
+    """
+    Reset the blocked search engines list (useful if engines recover from blocks).
+    
+    Returns:
+        Status message
+    """
+    get_searcher().reset_blocked_engines()
+    return "All search engines have been reset to available status"
 
 @mcp.tool()
 def get_webpage_content(url: str, max_length: int = 5000) -> Dict[str, Any]:
@@ -306,7 +535,7 @@ def get_webpage_content(url: str, max_length: int = 5000) -> Dict[str, Any]:
 def main():
     """Main entry point for the MCP server."""
     try:
-        logger.info("Starting Web Search MCP Server...")
+        logger.info("Starting Web Search MCP Server with fallback support...")
         mcp.run(transport="stdio")
     except KeyboardInterrupt:
         logger.info("Server interrupted by user")

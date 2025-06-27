@@ -15,3 +15,8 @@ dependencies = [
 
 [project.scripts]
 web-search-mcp = "main:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.1",
+]
