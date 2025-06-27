@@ -1,4 +1,5 @@
 # Web Search MCP
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/pranavms13/web-search-mcp)
 
 A Model Context Protocol (MCP) server that provides web search functionality using a headless Chrome browser to scrape Google search results.
 
@@ -149,4 +150,10 @@ To modify or extend the functionality:
 
 ## License
 
-This project is open source. Please respect website terms of service and robots.txt when scraping.
+This project is licensed under MIT License. You can check it out at - [LICENSE](/LICENSE)
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+
