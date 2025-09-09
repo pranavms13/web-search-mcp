@@ -3,6 +3,8 @@
 
 A Model Context Protocol (MCP) server that provides web search functionality using a headless Chrome browser to scrape Google, DuckDuckGo and Bing search results.
 
+[![Install MCP Server](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=web-search-mcp&config=eyJjb21tYW5kIjoidXZ4IGdpdCtodHRwczovL2dpdGh1Yi5jb20vcHJhbmF2bXMxMy93ZWItc2VhcmNoLW1jcCIsImVudiI6e319)
+
 ## Features
 
 - **Google Search**: Search Google and get structured results with titles, URLs, snippets, and rankings
