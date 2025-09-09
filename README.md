@@ -83,9 +83,9 @@ Add this configuration to your Claude Desktop MCP settings:
 ```json
 {
   "mcpServers": {
-    "web-search": {
-      "command": "python",
-      "args": ["/path/to/your/web-search-mcp/main.py"]
+    "web-search-mcp": {
+      "command": "uvx",
+      "args": ["git+https://github.com/pranavms13/web-search-mcp"]
     }
   }
 }
