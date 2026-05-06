@@ -71,7 +71,7 @@ class WebSearcher:
 
     def _configure_chromium_options(self, options: ChromeOptions | EdgeOptions, user_agent: str) -> None:
         """Apply shared Chromium options for Chrome and Edge."""
-        # options.add_argument("--headless")
+        options.add_argument("--headless")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
@@ -83,7 +83,7 @@ class WebSearcher:
 
     def _configure_firefox_options(self, options: FirefoxOptions, user_agent: str) -> None:
         """Apply Firefox-specific options."""
-        # options.add_argument("-headless")
+        options.add_argument("--headless")
         options.add_argument("--width=1920")
         options.add_argument("--height=1080")
         options.set_preference("general.useragent.override", user_agent)
