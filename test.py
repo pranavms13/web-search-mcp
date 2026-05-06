@@ -417,7 +417,7 @@ class TestMCPTools:
         mock_searcher.search_with_fallback.return_value = (sample_results, 'google')
         mock_get_searcher.return_value = mock_searcher
 
-        results = search_web.fn("test query", max_results=5, include_snippets=False, browser="firefox")
+        results = search_web("test query", max_results=5, include_snippets=False, browser="firefox")
 
         assert results == sample_results
         mock_get_searcher.assert_called_once_with("firefox")
@@ -430,7 +430,7 @@ class TestMCPTools:
         mock_searcher.search_with_fallback.return_value = (sample_results, 'google')
         mock_get_searcher.return_value = mock_searcher
 
-        results = search_web.fn("test query")
+        results = search_web("test query")
 
         assert results == sample_results
         mock_get_searcher.assert_called_once_with("chrome")
