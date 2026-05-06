@@ -6,11 +6,25 @@ to scrape search results from multiple search engines with fallback support.
 """
 
 import asyncio
+import io
 import logging
+import os
+import platform
 import re
+import shutil
+import stat
+import subprocess
+import tempfile
 import time
+import zipfile
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus, urljoin, urlparse
+
+try:
+    import winreg  # type: ignore
+except ImportError:  # pragma: no cover
+    winreg = None
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options as ChromeOptions
@@ -25,7 +39,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from webdriver_manager.chrome import ChromeDriverManager
 from webdriver_manager.firefox import GeckoDriverManager
-from webdriver_manager.microsoft import EdgeChromiumDriverManager
 from bs4 import BeautifulSoup, Tag
 import requests
 
@@ -44,6 +57,8 @@ BROWSER_USER_AGENTS = {
     "edge": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
     "firefox": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
 }
+
+EDGE_DRIVER_VERSION_PATTERN = re.compile(r"\d+\.\d+\.\d+\.\d+")
 
 class WebSearcher:
     """Web search functionality using Selenium browsers with fallback support."""
@@ -87,6 +102,239 @@ class WebSearcher:
         options.add_argument("--width=1920")
         options.add_argument("--height=1080")
         options.set_preference("general.useragent.override", user_agent)
+
+    @staticmethod
+    def _resolve_local_edge_driver_path() -> Optional[str]:
+        """Resolve a local EdgeDriver path from env vars or PATH."""
+        env_candidates = [
+            os.getenv("MSEDGEDRIVER_PATH"),
+            os.getenv("WEBDRIVER_EDGE_DRIVER"),
+        ]
+
+        for candidate in env_candidates:
+            if not candidate:
+                continue
+            if os.path.isfile(candidate):
+                return candidate
+            logger.warning("Ignoring invalid EdgeDriver path: %s", candidate)
+
+        return shutil.which("msedgedriver") or shutil.which("msedgedriver.exe")
+
+    @staticmethod
+    def _extract_version_from_text(text: str) -> Optional[str]:
+        """Extract a four-part version from arbitrary text."""
+        match = EDGE_DRIVER_VERSION_PATTERN.search(text or "")
+        return match.group(0) if match else None
+
+    @staticmethod
+    def _edge_binary_candidates() -> List[str]:
+        """Return likely Edge binary locations by platform."""
+        system = platform.system().lower()
+
+        candidates: List[str] = []
+        if system == "windows":
+            program_files = os.getenv("PROGRAMFILES")
+            program_files_x86 = os.getenv("PROGRAMFILES(X86)")
+            local_app_data = os.getenv("LOCALAPPDATA")
+            if program_files:
+                candidates.append(os.path.join(program_files, "Microsoft", "Edge", "Application", "msedge.exe"))
+            if program_files_x86:
+                candidates.append(os.path.join(program_files_x86, "Microsoft", "Edge", "Application", "msedge.exe"))
+            if local_app_data:
+                candidates.append(os.path.join(local_app_data, "Microsoft", "Edge", "Application", "msedge.exe"))
+
+            which_binary = shutil.which("msedge.exe") or shutil.which("msedge")
+            if which_binary:
+                candidates.append(which_binary)
+        elif system == "darwin":
+            candidates.extend([
+                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                "/Applications/Microsoft Edge Beta.app/Contents/MacOS/Microsoft Edge Beta",
+            ])
+            which_binary = shutil.which("microsoft-edge")
+            if which_binary:
+                candidates.append(which_binary)
+        else:
+            for binary in ["microsoft-edge", "microsoft-edge-stable", "microsoft-edge-beta", "microsoft-edge-dev"]:
+                which_binary = shutil.which(binary)
+                if which_binary:
+                    candidates.append(which_binary)
+
+        # Deduplicate while preserving order
+        seen = set()
+        unique_candidates = []
+        for candidate in candidates:
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                unique_candidates.append(candidate)
+
+        return unique_candidates
+
+    def _get_installed_edge_version(self) -> str:
+        """Detect installed Edge browser version from binary output."""
+        if platform.system().lower() == "windows":
+            registry_version = self._get_installed_edge_version_from_windows_registry()
+            if registry_version:
+                return registry_version
+
+        for binary in self._edge_binary_candidates():
+            if not os.path.isfile(binary):
+                continue
+            try:
+                result = subprocess.run(
+                    [binary, "--version"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                combined_output = f"{result.stdout}\n{result.stderr}".strip()
+                version = self._extract_version_from_text(combined_output)
+                if version:
+                    logger.info("Detected Microsoft Edge version %s from %s", version, binary)
+                    return version
+            except Exception as e:
+                logger.warning("Failed to probe Edge version from %s: %s", binary, e)
+
+        raise RuntimeError(
+            "Could not detect Microsoft Edge version automatically. "
+            "Install Edge or set MSEDGEDRIVER_PATH/WEBDRIVER_EDGE_DRIVER to a local driver binary."
+        )
+
+    @staticmethod
+    def _get_installed_edge_version_from_windows_registry() -> Optional[str]:
+        """Read installed Edge version from Windows registry BLBeacon keys."""
+        if winreg is None:
+            return None
+
+        key_candidates = [
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Edge\BLBeacon"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Edge\BLBeacon"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Edge\BLBeacon"),
+        ]
+
+        for hive, key_path in key_candidates:
+            try:
+                with winreg.OpenKey(hive, key_path) as key:
+                    value, _ = winreg.QueryValueEx(key, "version")
+                    version = EDGE_DRIVER_VERSION_PATTERN.search(str(value) if value else "")
+                    if version:
+                        logger.info("Detected Microsoft Edge version %s from registry %s", version.group(0), key_path)
+                        return version.group(0)
+            except OSError:
+                continue
+
+        return None
+
+    @staticmethod
+    def _edge_driver_asset_name() -> str:
+        """Resolve the platform-specific EdgeDriver zip asset name."""
+        system = platform.system().lower()
+        machine = platform.machine().lower()
+
+        if system == "windows":
+            if "arm" in machine or "aarch64" in machine:
+                return "edgedriver_arm64.zip"
+            if machine in ("x86", "i386", "i686"):
+                return "edgedriver_win32.zip"
+            return "edgedriver_win64.zip"
+
+        if system == "darwin":
+            if "arm" in machine or "aarch64" in machine:
+                return "edgedriver_mac64_m1.zip"
+            return "edgedriver_mac64.zip"
+
+        return "edgedriver_linux64.zip"
+
+    def _edge_driver_cache_dir(self) -> Path:
+        """Return local cache directory for downloaded EdgeDriver binaries."""
+        return Path.home() / ".wdm" / "drivers" / "msedgedriver"
+
+    def _fetch_latest_compatible_edge_driver_version(self, edge_version: str) -> Optional[str]:
+        """Resolve latest compatible EdgeDriver version for same major.minor.build."""
+        parts = edge_version.split(".")
+        if len(parts) < 3:
+            return None
+
+        major = parts[0]
+        build_prefix = ".".join(parts[:3])
+
+        candidate_endpoints = [
+            f"https://msedgedriver.microsoft.com/LATEST_RELEASE_{build_prefix}",
+            f"https://msedgedriver.microsoft.com/LATEST_RELEASE_{major}_WINDOWS",
+            f"https://msedgedriver.microsoft.com/LATEST_RELEASE_{major}",
+        ]
+
+        for endpoint in candidate_endpoints:
+            try:
+                response = requests.get(endpoint, timeout=10)
+                if response.status_code != 200:
+                    continue
+                version = self._extract_version_from_text(response.text.strip())
+                if version:
+                    logger.info("Resolved compatible EdgeDriver version %s via %s", version, endpoint)
+                    return version
+            except Exception:
+                continue
+
+        return None
+
+    def _download_and_extract_edge_driver(self, driver_version: str) -> str:
+        """Download and extract EdgeDriver for the host platform from msedgedriver.microsoft.com."""
+        asset_name = self._edge_driver_asset_name()
+        executable_name = "msedgedriver.exe" if platform.system().lower() == "windows" else "msedgedriver"
+
+        target_dir = self._edge_driver_cache_dir() / driver_version
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_executable = target_dir / executable_name
+
+        if target_executable.exists():
+            return str(target_executable)
+
+        download_url = f"https://msedgedriver.microsoft.com/{driver_version}/{asset_name}"
+        logger.info("Downloading EdgeDriver from %s", download_url)
+
+        response = requests.get(download_url, timeout=30)
+        response.raise_for_status()
+
+        with zipfile.ZipFile(io.BytesIO(response.content)) as zip_file:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                zip_file.extractall(temp_dir)
+                extracted_driver = None
+                for path in Path(temp_dir).rglob(executable_name):
+                    extracted_driver = path
+                    break
+
+                if extracted_driver is None:
+                    raise RuntimeError(f"EdgeDriver executable '{executable_name}' not found in downloaded archive")
+
+                shutil.copy2(extracted_driver, target_executable)
+
+        if platform.system().lower() != "windows":
+            target_executable.chmod(target_executable.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+        return str(target_executable)
+
+    def _install_edge_driver_for_current_browser(self) -> str:
+        """Install a matching EdgeDriver from msedgedriver.microsoft.com."""
+        edge_version = self._get_installed_edge_version()
+        candidate_versions = [edge_version]
+
+        compatible_version = self._fetch_latest_compatible_edge_driver_version(edge_version)
+        if compatible_version and compatible_version not in candidate_versions:
+            candidate_versions.append(compatible_version)
+
+        errors: List[str] = []
+        for version in candidate_versions:
+            try:
+                return self._download_and_extract_edge_driver(version)
+            except Exception as e:
+                errors.append(f"{version}: {e}")
+
+        raise RuntimeError(
+            "Failed to download Microsoft Edge WebDriver from msedgedriver.microsoft.com. "
+            f"Tried versions: {', '.join(candidate_versions)}. Details: {' | '.join(errors)}"
+        )
     
     def _setup_driver(self):
         """Set up the configured Selenium browser driver."""
@@ -99,7 +347,15 @@ class WebSearcher:
             elif self.browser == "edge":
                 browser_options = EdgeOptions()
                 self._configure_chromium_options(browser_options, BROWSER_USER_AGENTS["edge"])
-                service = EdgeService(EdgeChromiumDriverManager().install())
+
+                local_edge_driver_path = self._resolve_local_edge_driver_path()
+                if local_edge_driver_path:
+                    logger.info("Using local EdgeDriver from: %s", local_edge_driver_path)
+                    edge_driver_path = local_edge_driver_path
+                else:
+                    edge_driver_path = self._install_edge_driver_for_current_browser()
+
+                service = EdgeService(edge_driver_path)
                 self.driver = webdriver.Edge(service=service, options=browser_options)
             else:
                 browser_options = FirefoxOptions()

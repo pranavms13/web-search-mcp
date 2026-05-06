@@ -85,7 +85,6 @@ class TestSearchEngineInitialization:
         ("browser", "manager_path", "driver_path", "driver_binary_path"),
         [
             ("chrome", "main.ChromeDriverManager", "main.webdriver.Chrome", "/path/to/chromedriver"),
-            ("edge", "main.EdgeChromiumDriverManager", "main.webdriver.Edge", "/path/to/edgedriver"),
             ("firefox", "main.GeckoDriverManager", "main.webdriver.Firefox", "/path/to/geckodriver"),
         ],
     )
@@ -106,6 +105,111 @@ class TestSearchEngineInitialization:
         mock_webdriver.assert_called_once()
         assert "service" in mock_webdriver.call_args.kwargs
         assert "options" in mock_webdriver.call_args.kwargs
+
+    @patch('main.webdriver.Edge')
+    @patch.object(WebSearcher, '_resolve_local_edge_driver_path', return_value='/local/msedgedriver.exe')
+    @patch.object(WebSearcher, '_install_edge_driver_for_current_browser')
+    def test_edge_driver_setup_uses_local_driver_first(self, mock_install_edge_driver, _mock_local_path, mock_edge):
+        """Test Edge setup prefers local driver and skips remote download."""
+        searcher = WebSearcher(browser='edge')
+        mock_driver_instance = MagicMock()
+        mock_edge.return_value = mock_driver_instance
+
+        searcher._setup_driver()
+
+        assert searcher.driver == mock_driver_instance
+        assert searcher.driver_initialized is True
+        mock_install_edge_driver.assert_not_called()
+        mock_edge.assert_called_once()
+
+    @patch('main.webdriver.Edge')
+    @patch.object(WebSearcher, '_resolve_local_edge_driver_path', return_value=None)
+    @patch.object(WebSearcher, '_install_edge_driver_for_current_browser', return_value='/download/msedgedriver.exe')
+    def test_edge_driver_setup_downloads_when_local_missing(self, _mock_install_edge_driver, _mock_local_path, mock_edge):
+        """Test Edge setup downloads/installs driver when local path is unavailable."""
+        searcher = WebSearcher(browser='edge')
+        mock_driver_instance = MagicMock()
+        mock_edge.return_value = mock_driver_instance
+
+        searcher._setup_driver()
+
+        assert searcher.driver == mock_driver_instance
+        assert searcher.driver_initialized is True
+        mock_edge.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("system", "machine", "expected_asset"),
+        [
+            ("Windows", "AMD64", "edgedriver_win64.zip"),
+            ("Windows", "x86", "edgedriver_win32.zip"),
+            ("Windows", "ARM64", "edgedriver_arm64.zip"),
+            ("Darwin", "x86_64", "edgedriver_mac64.zip"),
+            ("Darwin", "arm64", "edgedriver_mac64_m1.zip"),
+            ("Linux", "x86_64", "edgedriver_linux64.zip"),
+        ],
+    )
+    @patch('main.platform.machine')
+    @patch('main.platform.system')
+    def test_edge_driver_asset_name_by_platform(self, mock_system, mock_machine, system, machine, expected_asset):
+        """Test platform-specific EdgeDriver asset names."""
+        mock_system.return_value = system
+        mock_machine.return_value = machine
+
+        assert WebSearcher._edge_driver_asset_name() == expected_asset
+
+    @patch.object(WebSearcher, '_extract_version_from_text', return_value='147.0.3912.98')
+    @patch('main.requests.get')
+    def test_fetch_latest_compatible_edge_driver_version(self, mock_get, _mock_extract_version):
+        """Test compatible EdgeDriver version endpoint lookup."""
+        searcher = WebSearcher(browser='edge')
+        response = MagicMock()
+        response.status_code = 200
+        response.text = '147.0.3912.98'
+        mock_get.return_value = response
+
+        version = searcher._fetch_latest_compatible_edge_driver_version('147.0.3912.95')
+
+        assert version == '147.0.3912.98'
+        assert mock_get.called
+
+    @patch.object(WebSearcher, '_download_and_extract_edge_driver', side_effect=['/driver/path/msedgedriver.exe'])
+    @patch.object(WebSearcher, '_fetch_latest_compatible_edge_driver_version', return_value='147.0.3912.98')
+    @patch.object(WebSearcher, '_get_installed_edge_version', return_value='147.0.3912.95')
+    def test_install_edge_driver_for_current_browser_tries_exact_then_compatible(
+        self,
+        _mock_detect,
+        _mock_fetch_compatible,
+        mock_download_extract,
+    ):
+        """Test installer first tries exact browser version."""
+        searcher = WebSearcher(browser='edge')
+
+        path = searcher._install_edge_driver_for_current_browser()
+
+        assert path == '/driver/path/msedgedriver.exe'
+        first_call_args = mock_download_extract.call_args_list[0][0]
+        assert first_call_args[0] == '147.0.3912.95'
+
+    @patch.object(WebSearcher, '_get_installed_edge_version_from_windows_registry', return_value='147.0.3912.98')
+    @patch('main.platform.system', return_value='Windows')
+    @patch.object(WebSearcher, '_edge_binary_candidates', return_value=[])
+    def test_get_installed_edge_version_prefers_windows_registry(self, _mock_candidates, _mock_system, _mock_registry):
+        """Test Windows version detection uses registry first."""
+        searcher = WebSearcher(browser='edge')
+
+        version = searcher._get_installed_edge_version()
+
+        assert version == '147.0.3912.98'
+
+    @patch.object(WebSearcher, '_get_installed_edge_version_from_windows_registry', return_value=None)
+    @patch('main.platform.system', return_value='Windows')
+    @patch.object(WebSearcher, '_edge_binary_candidates', return_value=[])
+    def test_get_installed_edge_version_raises_when_registry_and_binaries_fail(self, _mock_candidates, _mock_system, _mock_registry):
+        """Test Windows detection raises clear error when no version source is available."""
+        searcher = WebSearcher(browser='edge')
+
+        with pytest.raises(RuntimeError, match='Could not detect Microsoft Edge version automatically'):
+            searcher._get_installed_edge_version()
     
     @patch('main.webdriver.Chrome')
     @patch('main.ChromeDriverManager')
