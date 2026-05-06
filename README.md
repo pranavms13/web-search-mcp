@@ -171,6 +171,40 @@ Windows example path:
 }
 ```
 
+### Run via `uvx` with local EdgeDriver (optional)
+
+If your environment blocks driver downloads, provide a local `msedgedriver` path:
+
+```json
+{
+  "mcpServers": {
+    "web-search-mcp": {
+      "command": "uvx",
+      "args": ["git+https://github.com/naml14/web-search"],
+      "env": {
+        "MSEDGEDRIVER_PATH": "C:\\tools\\edgedriver\\msedgedriver.exe"
+      }
+    }
+  }
+}
+```
+
+Alternative key:
+
+```json
+{
+  "mcpServers": {
+    "web-search-mcp": {
+      "command": "uvx",
+      "args": ["git+https://github.com/naml14/web-search"],
+      "env": {
+        "WEBDRIVER_EDGE_DRIVER": "C:\\tools\\edgedriver\\msedgedriver.exe"
+      }
+    }
+  }
+}
+```
+
 ---
 
 ## Usage examples (natural language in MCP client)
@@ -204,7 +238,8 @@ asyncio.run(main())
 
 - `chrome` and `edge` use Chromium-like flags
 - `firefox` uses Firefox-specific options and UA override
-- Driver binaries are managed automatically via `webdriver-manager`
+- `chrome` and `firefox` drivers are managed via `webdriver-manager`
+- `edge` now prefers a local `msedgedriver` binary, and otherwise downloads from `https://msedgedriver.microsoft.com`
 
 ---
 
@@ -231,6 +266,37 @@ Check:
 Try switching browser parameter:
 
 - `edge` → `chrome` → `firefox`
+
+#### Microsoft Edge WebDriver matching strategy
+
+For Edge, this project follows Microsoft guidance:
+
+- Detect installed Edge version (for example `147.0.3912.98`).
+  - On Windows, version is read from the Edge registry (`BLBeacon`) first.
+  - CLI `msedge --version` is used only as a fallback.
+- Try matching EdgeDriver version first.
+- If exact match is unavailable, resolve a compatible release with same `major.minor.build`.
+- Download the platform ZIP from `https://msedgedriver.microsoft.com/{version}/...`.
+
+Examples:
+
+- Windows x64: `https://msedgedriver.microsoft.com/147.0.3912.98/edgedriver_win64.zip`
+- Windows x86: `https://msedgedriver.microsoft.com/147.0.3912.98/edgedriver_win32.zip`
+- Windows ARM64: `https://msedgedriver.microsoft.com/147.0.3912.98/edgedriver_arm64.zip`
+- macOS Intel: `https://msedgedriver.microsoft.com/147.0.3912.98/edgedriver_mac64.zip`
+- macOS Apple Silicon: `https://msedgedriver.microsoft.com/147.0.3912.98/edgedriver_mac64_m1.zip`
+- Linux x64: `https://msedgedriver.microsoft.com/147.0.3912.98/edgedriver_linux64.zip`
+
+#### Edge local driver fallback (recommended)
+
+Resolution order for Edge driver:
+
+1. `MSEDGEDRIVER_PATH`
+2. `WEBDRIVER_EDGE_DRIVER`
+3. `msedgedriver` in `PATH`
+4. Download from `msedgedriver.microsoft.com`
+
+Downloaded drivers are cached under `~/.wdm/drivers/msedgedriver/<version>/`.
 
 ### Empty or inconsistent results
 
