@@ -9,7 +9,16 @@ from unittest.mock import Mock, MagicMock, patch
 from urllib.parse import quote_plus
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-from main import WebSearcher
+import main
+from main import WebSearcher, get_searcher, search_web
+
+
+@pytest.fixture(autouse=True)
+def reset_global_searchers():
+    """Ensure global cached searchers do not leak across tests."""
+    main.searchers.clear()
+    yield
+    main.searchers.clear()
 
 
 class TestWebSearcher:
@@ -72,19 +81,31 @@ class TestSearchEngineInitialization:
         assert 'duckduckgo' in engine_names
         assert 'bing' in engine_names
     
-    @patch('main.webdriver.Chrome')
-    @patch('main.ChromeDriverManager')
-    def test_driver_setup_success(self, mock_driver_manager, mock_chrome, searcher):
-        """Test successful Chrome driver setup."""
-        mock_driver_manager.return_value.install.return_value = "/path/to/chromedriver"
-        mock_driver_instance = MagicMock()
-        mock_chrome.return_value = mock_driver_instance
-        
-        searcher._setup_driver()
-        
+    @pytest.mark.parametrize(
+        ("browser", "manager_path", "driver_path", "driver_binary_path"),
+        [
+            ("chrome", "main.ChromeDriverManager", "main.webdriver.Chrome", "/path/to/chromedriver"),
+            ("edge", "main.EdgeChromiumDriverManager", "main.webdriver.Edge", "/path/to/edgedriver"),
+            ("firefox", "main.GeckoDriverManager", "main.webdriver.Firefox", "/path/to/geckodriver"),
+        ],
+    )
+    def test_driver_setup_supported_browsers(self, browser, manager_path, driver_path, driver_binary_path):
+        """Test successful driver setup for all supported browsers."""
+        searcher = WebSearcher(browser=browser)
+
+        with patch(manager_path) as mock_driver_manager, patch(driver_path) as mock_webdriver:
+            mock_driver_manager.return_value.install.return_value = driver_binary_path
+            mock_driver_instance = MagicMock()
+            mock_webdriver.return_value = mock_driver_instance
+
+            searcher._setup_driver()
+
         assert searcher.driver == mock_driver_instance
         assert searcher.driver_initialized is True
-        mock_chrome.assert_called_once()
+        mock_driver_manager.return_value.install.assert_called_once()
+        mock_webdriver.assert_called_once()
+        assert "service" in mock_webdriver.call_args.kwargs
+        assert "options" in mock_webdriver.call_args.kwargs
     
     @patch('main.webdriver.Chrome')
     @patch('main.ChromeDriverManager')
@@ -97,6 +118,11 @@ class TestSearchEngineInitialization:
         
         assert searcher.driver is None
         assert not searcher.driver_initialized
+
+    def test_invalid_browser_raises_clear_error(self):
+        """Test invalid browser validation returns a clear message."""
+        with pytest.raises(ValueError, match="Unsupported browser 'safari'. Supported browsers are: chrome, edge, firefox"):
+            WebSearcher(browser="safari")
 
 
 class TestGoogleSearch:
@@ -383,6 +409,32 @@ class TestMCPTools:
         assert len(results) == 1
         assert engine_used == 'google'
         mock_searcher.search_with_fallback.assert_called_once_with("test query", 5, True)
+
+    @patch('main.get_searcher')
+    def test_search_web_propagates_browser(self, mock_get_searcher, sample_results):
+        """Test MCP search tool passes the selected browser to the core layer."""
+        mock_searcher = MagicMock()
+        mock_searcher.search_with_fallback.return_value = (sample_results, 'google')
+        mock_get_searcher.return_value = mock_searcher
+
+        results = search_web.fn("test query", max_results=5, include_snippets=False, browser="firefox")
+
+        assert results == sample_results
+        mock_get_searcher.assert_called_once_with("firefox")
+        mock_searcher.search_with_fallback.assert_called_once_with("test query", 5, False)
+
+    @patch('main.get_searcher')
+    def test_search_web_defaults_to_chrome(self, mock_get_searcher, sample_results):
+        """Test MCP search tool remains backward compatible with Chrome as default."""
+        mock_searcher = MagicMock()
+        mock_searcher.search_with_fallback.return_value = (sample_results, 'google')
+        mock_get_searcher.return_value = mock_searcher
+
+        results = search_web.fn("test query")
+
+        assert results == sample_results
+        mock_get_searcher.assert_called_once_with("chrome")
+        mock_searcher.search_with_fallback.assert_called_once_with("test query", 10, True)
     
     @patch('main.get_searcher')
     def test_engine_status_functionality(self, mock_get_searcher):
@@ -454,6 +506,22 @@ class TestIntegration:
         searcher.reset_blocked_engines()
         status = searcher.get_engine_status()
         assert all(s == 'available' for s in status.values())
+
+    def test_get_searcher_returns_browser_specific_instances(self):
+        """Test global searchers are cached per browser."""
+        chrome_searcher = get_searcher()
+        edge_searcher = get_searcher("edge")
+        repeated_edge_searcher = get_searcher("edge")
+
+        assert chrome_searcher.browser == "chrome"
+        assert edge_searcher.browser == "edge"
+        assert chrome_searcher is not edge_searcher
+        assert repeated_edge_searcher is edge_searcher
+
+    def test_get_searcher_invalid_browser_raises_error(self):
+        """Test global searcher accessor rejects unsupported browsers."""
+        with pytest.raises(ValueError, match="Unsupported browser 'opera'. Supported browsers are: chrome, edge, firefox"):
+            get_searcher("opera")
 
 
 class TestEdgeCases:
