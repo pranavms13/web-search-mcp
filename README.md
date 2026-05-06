@@ -95,14 +95,34 @@ The server will start and listen for MCP connections.
 
 ### Using with Claude Desktop
 
-Add this configuration to your Claude Desktop MCP settings:
+If you want Claude Desktop to use your current local checkout of this repository, point it at the cloned folder with `uv`:
+
+```json
+{
+  "mcpServers": {
+    "web-search-mcp": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/absolute/path/to/web-search",
+        "run",
+        "web-search-mcp"
+      ]
+    }
+  }
+}
+```
+
+On Windows, replace `/absolute/path/to/web-search` with the path to your clone, for example `d:\\trabajo\\web-search`.
+
+If you prefer to run the GitHub version of this current repository instead of your local checkout, you can use:
 
 ```json
 {
   "mcpServers": {
     "web-search-mcp": {
       "command": "uvx",
-      "args": ["git+https://github.com/pranavms13/web-search-mcp"]
+      "args": ["git+https://github.com/naml14/web-search.git"]
     }
   }
 }
