@@ -1,499 +1,424 @@
 #!/usr/bin/env python3
 """
 Test suite for Web Search MCP Server
-Tests for Google, DuckDuckGo, and Bing search functionality
+Tests backend selection (Selenium / Obscura), search engines, parsing, and fallback.
 """
 
+import subprocess
 import pytest
-from unittest.mock import Mock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 from urllib.parse import quote_plus
-from selenium.common.exceptions import TimeoutException, WebDriverException
 
-from main import WebSearcher
+from main import (
+    WebSearcher,
+    SeleniumBackend,
+    ObscuraBackend,
+    _build_backend,
+)
 
 
-class TestWebSearcher:
-    """Test cases for the WebSearcher class."""
-    
-    @pytest.fixture
-    def searcher(self):
-        """Create a WebSearcher instance for testing."""
-        return WebSearcher()
-    
-    @pytest.fixture
-    def mock_driver(self):
-        """Create a mock Selenium WebDriver."""
+# ---------------------------------------------------------------------------
+# Sample rendered HTML for each engine (mirrors the real result markup)
+# ---------------------------------------------------------------------------
+
+GOOGLE_HTML = """
+<html><body>
+  <div class="g">
+    <a href="https://example.com/1"><h3>Test Result 1</h3></a>
+    <div class="VwiC3b">First test result snippet</div>
+  </div>
+  <div class="g">
+    <a href="https://example.org/2"><h3>Test Result 2</h3></a>
+    <div class="VwiC3b">Second test result snippet</div>
+  </div>
+</body></html>
+"""
+
+# DuckDuckGo wraps results in //duckduckgo.com/l/?uddg=<real-url>
+DDG_HTML = """
+<html><body>
+  <div class="result results_links web-result">
+    <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2F1&rut=x">DDG Result 1</a>
+    <a class="result__snippet">DDG snippet</a>
+  </div>
+</body></html>
+"""
+
+# Bing wraps results in /ck/a?...&u=a1<base64url real-url>; here a1...== decodes to https://example.com/1
+BING_HTML = """
+<html><body>
+  <li class="b_algo">
+    <h2><a href="https://www.bing.com/ck/a?!&p=z&u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS8x&ntb=1">Bing Result 1</a></h2>
+    <div class="b_caption"><p>Bing snippet</p></div>
+  </li>
+</body></html>
+"""
+
+
+def make_backend(html: str = "", title: str = "Test Page") -> MagicMock:
+    """A mock BrowserBackend whose fetch_html returns canned (html, title)."""
+    backend = MagicMock()
+    backend.name = "mock"
+    backend.fetch_html.return_value = (html, title)
+    return backend
+
+
+# ---------------------------------------------------------------------------
+# Backend selection
+# ---------------------------------------------------------------------------
+
+class TestBackendSelection:
+    """Test _build_backend honoring BROWSER_BACKEND / OBSCURA_BIN."""
+
+    def test_default_is_selenium(self):
+        with patch.dict("os.environ", {}, clear=True):
+            backend = _build_backend()
+        assert isinstance(backend, SeleniumBackend)
+        assert backend.name == "selenium"
+
+    def test_explicit_selenium(self):
+        with patch.dict("os.environ", {"BROWSER_BACKEND": "selenium"}, clear=True):
+            backend = _build_backend()
+        assert isinstance(backend, SeleniumBackend)
+
+    def test_obscura_with_explicit_binary(self):
+        with patch.dict("os.environ", {"BROWSER_BACKEND": "obscura", "OBSCURA_BIN": "/usr/bin/obscura"}, clear=True):
+            backend = _build_backend()
+        assert isinstance(backend, ObscuraBackend)
+        assert backend.binary == "/usr/bin/obscura"
+
+    def test_obscura_found_on_path(self):
+        with patch.dict("os.environ", {"BROWSER_BACKEND": "obscura"}, clear=True):
+            with patch("main.shutil.which", return_value="/opt/obscura"):
+                backend = _build_backend()
+        assert isinstance(backend, ObscuraBackend)
+        assert backend.binary == "/opt/obscura"
+
+    def test_obscura_missing_falls_back_to_selenium(self):
+        with patch.dict("os.environ", {"BROWSER_BACKEND": "obscura"}, clear=True):
+            with patch("main.shutil.which", return_value=None):
+                backend = _build_backend()
+        assert isinstance(backend, SeleniumBackend)
+
+
+# ---------------------------------------------------------------------------
+# Obscura backend
+# ---------------------------------------------------------------------------
+
+class TestObscuraBackend:
+    """Test the Obscura CLI subprocess wrapper."""
+
+    def test_fetch_html_success(self):
+        backend = ObscuraBackend("/usr/bin/obscura")
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout="<html><head><title>Hello</title></head><body>hi</body></html>",
+            stderr="",
+        )
+        with patch("main.subprocess.run", return_value=completed) as mock_run:
+            html, title = backend.fetch_html("https://example.com", timeout=10)
+
+        assert "Hello" in html
+        assert title == "Hello"
+        cmd = mock_run.call_args.args[0]
+        assert cmd[:4] == ["/usr/bin/obscura", "fetch", "https://example.com", "--dump"]
+        assert "html" in cmd
+        assert "--wait-until" in cmd
+        assert "--timeout" in cmd
+
+    def test_fetch_html_nonzero_exit_raises(self):
+        backend = ObscuraBackend("/usr/bin/obscura")
+        completed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="boom")
+        with patch("main.subprocess.run", return_value=completed):
+            with pytest.raises(Exception, match="Obscura fetch failed"):
+                backend.fetch_html("https://example.com")
+
+    def test_fetch_html_timeout_raises(self):
+        backend = ObscuraBackend("/usr/bin/obscura")
+        with patch("main.subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="obscura", timeout=5)):
+            with pytest.raises(Exception, match="Obscura timed out"):
+                backend.fetch_html("https://example.com")
+
+
+# ---------------------------------------------------------------------------
+# Selenium backend
+# ---------------------------------------------------------------------------
+
+class TestSeleniumBackend:
+    """Test the Selenium backend driver lifecycle."""
+
+    @patch("main.webdriver.Chrome")
+    @patch("main.ChromeDriverManager")
+    def test_driver_setup_success(self, mock_driver_manager, mock_chrome):
+        mock_driver_manager.return_value.install.return_value = "/path/to/chromedriver"
+        mock_instance = MagicMock()
+        mock_instance.page_source = "<html><body>ok</body></html>"
+        mock_instance.title = "OK"
+        mock_chrome.return_value = mock_instance
+
+        backend = SeleniumBackend()
+        with patch("main.time.sleep"), patch("main.WebDriverWait"):
+            html, title = backend.fetch_html("https://example.com")
+
+        assert "ok" in html
+        assert title == "OK"
+        mock_instance.get.assert_called_once_with("https://example.com")
+        mock_chrome.assert_called_once()
+
+    def test_close_quits_driver(self):
+        backend = SeleniumBackend()
         mock_driver = MagicMock()
-        mock_driver.page_source = "<html><body>Test page</body></html>"
-        mock_driver.title = "Test Page"
-        return mock_driver
-    
-    @pytest.fixture
-    def sample_results(self):
-        """Sample search results for testing."""
-        return [
-            {
-                "title": "Test Result 1",
-                "url": "https://example.com/1",
-                "domain": "example.com",
-                "snippet": "First test result",
-                "rank": 1,
-                "source_engine": "google"
-            },
-            {
-                "title": "Test Result 2", 
-                "url": "https://example.org/2",
-                "domain": "example.org",
-                "snippet": "Second test result",
-                "rank": 2,
-                "source_engine": "google"
-            }
-        ]
+        backend.driver = mock_driver
+        backend.close()
+        mock_driver.quit.assert_called_once()
+        assert backend.driver is None
 
+
+# ---------------------------------------------------------------------------
+# Searcher init
+# ---------------------------------------------------------------------------
 
 class TestSearchEngineInitialization:
-    """Test search engine initialization and setup."""
-    
+
     @pytest.fixture
     def searcher(self):
-        """Create a WebSearcher instance for testing."""
         return WebSearcher()
-    
+
     def test_searcher_initialization(self, searcher):
-        """Test WebSearcher initializes correctly."""
-        assert searcher.driver is None
-        assert not searcher.driver_initialized
+        assert searcher.backend is None
         assert len(searcher.search_engines) == 3
         assert searcher.blocked_engines == set()
-        
-        # Check search engines are configured correctly
         engine_names = [engine['name'] for engine in searcher.search_engines]
-        assert 'google' in engine_names
-        assert 'duckduckgo' in engine_names
-        assert 'bing' in engine_names
-    
-    @patch('main.webdriver.Chrome')
-    @patch('main.ChromeDriverManager')
-    def test_driver_setup_success(self, mock_driver_manager, mock_chrome, searcher):
-        """Test successful Chrome driver setup."""
-        mock_driver_manager.return_value.install.return_value = "/path/to/chromedriver"
-        mock_driver_instance = MagicMock()
-        mock_chrome.return_value = mock_driver_instance
-        
-        searcher._setup_driver()
-        
-        assert searcher.driver == mock_driver_instance
-        assert searcher.driver_initialized is True
-        mock_chrome.assert_called_once()
-    
-    @patch('main.webdriver.Chrome')
-    @patch('main.ChromeDriverManager')
-    def test_driver_setup_failure(self, mock_driver_manager, mock_chrome, searcher):
-        """Test Chrome driver setup failure."""
-        mock_chrome.side_effect = Exception("Driver setup failed")
-        
-        with pytest.raises(Exception, match="Driver setup failed"):
-            searcher._setup_driver()
-        
-        assert searcher.driver is None
-        assert not searcher.driver_initialized
+        assert {'google', 'duckduckgo', 'bing'} <= set(engine_names)
 
+
+# ---------------------------------------------------------------------------
+# Per-engine search + parsing
+# ---------------------------------------------------------------------------
 
 class TestGoogleSearch:
-    """Test Google search functionality."""
-    
+
     @pytest.fixture
     def searcher(self):
         return WebSearcher()
-    
-    @pytest.fixture
-    def mock_driver(self):
-        mock_driver = MagicMock()
-        mock_driver.page_source = "<html><body>Test page</body></html>"
-        mock_driver.title = "Test Page"
-        return mock_driver
-    
-    @pytest.fixture
-    def sample_results(self):
-        return [
-            {
-                "title": "Test Result 1",
-                "url": "https://example.com/1",
-                "domain": "example.com",
-                "snippet": "First test result",
-                "rank": 1,
-                "source_engine": "google"
-            }
-        ]
-    
-    def test_search_google_success(self, searcher, mock_driver, sample_results):
-        """Test successful Google search."""
-        searcher.driver = mock_driver
-        searcher.driver_initialized = True
-        
-        with patch.object(searcher, '_parse_google_results', return_value=sample_results):
-            with patch.object(searcher, '_is_google_blocked', return_value=False):
-                results = searcher._search_google("test query", 10, True)
-        
-        assert len(results) == 1
+
+    def test_search_google_success(self, searcher):
+        searcher.backend = make_backend(GOOGLE_HTML)
+        results = searcher._search_google("test query", 10, True)
+
+        assert len(results) == 2
         assert results[0]['source_engine'] == 'google'
+        assert results[0]['url'] == "https://example.com/1"
+        assert results[0]['snippet'] == "First test result snippet"
         expected_url = f"https://www.google.com/search?q={quote_plus('test query')}&num=10"
-        mock_driver.get.assert_called_with(expected_url)
-    
-    def test_search_google_blocked(self, searcher, mock_driver):
-        """Test Google search when blocked."""
-        searcher.driver = mock_driver
-        searcher.driver_initialized = True
-        
-        with patch.object(searcher, '_is_google_blocked', return_value=True):
-            with pytest.raises(Exception, match="Google has blocked"):
-                searcher._search_google("test query", 10, True)
-    
-    def test_is_google_blocked_detection(self, searcher, mock_driver):
-        """Test Google blocking detection."""
-        searcher.driver = mock_driver
-        
-        # Test blocked page
-        mock_driver.page_source = "unusual traffic from your computer"
-        assert searcher._is_google_blocked() is True
-        
-        # Test normal page
-        mock_driver.page_source = "Normal search results"
-        assert searcher._is_google_blocked() is False
+        searcher.backend.fetch_html.assert_called_with(expected_url)
+
+    def test_search_google_blocked(self, searcher):
+        searcher.backend = make_backend("Our systems have detected unusual traffic")
+        with pytest.raises(Exception, match="Google has blocked"):
+            searcher._search_google("test query", 10, True)
+
+    def test_is_google_blocked_detection(self):
+        assert WebSearcher._is_google_blocked("unusual traffic from your computer") is True
+        assert WebSearcher._is_google_blocked("Normal search results") is False
+
+    def test_max_results_limits_output(self, searcher):
+        searcher.backend = make_backend(GOOGLE_HTML)
+        results = searcher._search_google("q", 1, True)
+        assert len(results) == 1
+
+    def test_backend_error_propagates(self, searcher):
+        backend = MagicMock()
+        backend.fetch_html.side_effect = Exception("network down")
+        searcher.backend = backend
+        with pytest.raises(Exception):
+            searcher._search_google("q", 10, True)
 
 
 class TestDuckDuckGoSearch:
-    """Test DuckDuckGo search functionality."""
-    
+
     @pytest.fixture
     def searcher(self):
         return WebSearcher()
-    
-    @pytest.fixture
-    def mock_driver(self):
-        mock_driver = MagicMock()
-        return mock_driver
-    
-    @pytest.fixture
-    def sample_results(self):
-        return [
-            {
-                "title": "DDG Result 1",
-                "url": "https://example.com/1",
-                "domain": "example.com",
-                "snippet": "DDG test result",
-                "rank": 1,
-                "source_engine": "duckduckgo"
-            }
-        ]
-    
-    def test_search_duckduckgo_success(self, searcher, mock_driver, sample_results):
-        """Test successful DuckDuckGo search."""
-        searcher.driver = mock_driver
-        searcher.driver_initialized = True
-        
-        with patch.object(searcher, '_parse_duckduckgo_results', return_value=sample_results):
-            results = searcher._search_duckduckgo("test query", 10, True)
-        
+
+    def test_search_duckduckgo_success(self, searcher):
+        searcher.backend = make_backend(DDG_HTML)
+        results = searcher._search_duckduckgo("test query", 10, True)
+
         assert len(results) == 1
         assert results[0]['source_engine'] == 'duckduckgo'
-        expected_url = f"https://duckduckgo.com/?q={quote_plus('test query')}"
-        mock_driver.get.assert_called_with(expected_url)
-    
-    def test_search_duckduckgo_no_driver(self, searcher):
-        """Test DuckDuckGo search without driver."""
-        with pytest.raises(Exception, match="Driver not initialized"):
-            searcher._search_duckduckgo("test query", 10, True)
+        assert results[0]['url'] == "https://example.com/1"
+        assert results[0]['snippet'] == "DDG snippet"
+        expected_url = f"https://html.duckduckgo.com/html/?q={quote_plus('test query')}"
+        searcher.backend.fetch_html.assert_called_with(expected_url)
 
 
 class TestBingSearch:
-    """Test Bing search functionality."""
-    
+
     @pytest.fixture
     def searcher(self):
         return WebSearcher()
-    
-    @pytest.fixture
-    def mock_driver(self):
-        mock_driver = MagicMock()
-        return mock_driver
-    
-    @pytest.fixture
-    def sample_results(self):
-        return [
-            {
-                "title": "Bing Result 1",
-                "url": "https://example.com/1",
-                "domain": "example.com",
-                "snippet": "Bing test result",
-                "rank": 1,
-                "source_engine": "bing"
-            }
-        ]
-    
-    def test_search_bing_success(self, searcher, mock_driver, sample_results):
-        """Test successful Bing search."""
-        searcher.driver = mock_driver
-        searcher.driver_initialized = True
-        
-        with patch.object(searcher, '_parse_bing_results', return_value=sample_results):
-            results = searcher._search_bing("test query", 10, True)
-        
+
+    def test_search_bing_success(self, searcher):
+        searcher.backend = make_backend(BING_HTML)
+        results = searcher._search_bing("test query", 10, True)
+
         assert len(results) == 1
         assert results[0]['source_engine'] == 'bing'
+        assert results[0]['url'] == "https://example.com/1"
+        assert results[0]['snippet'] == "Bing snippet"
         expected_url = f"https://www.bing.com/search?q={quote_plus('test query')}"
-        mock_driver.get.assert_called_with(expected_url)
-    
-    def test_search_bing_no_driver(self, searcher):
-        """Test Bing search without driver."""
-        with pytest.raises(Exception, match="Driver not initialized"):
-            searcher._search_bing("test query", 10, True)
+        searcher.backend.fetch_html.assert_called_with(expected_url)
+
+
+# ---------------------------------------------------------------------------
+# Fallback
+# ---------------------------------------------------------------------------
+
+class TestUrlNormalization:
+    """Test redirect-URL unwrapping for each engine."""
+
+    def test_google_url_wrapper(self):
+        assert WebSearcher._normalize_url("/url?q=https%3A%2F%2Fexample.org%2Fa&sa=U") == "https://example.org/a"
+
+    def test_duckduckgo_redirect(self):
+        out = WebSearcher._normalize_url("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2F1&rut=x")
+        assert out == "https://example.com/1"
+
+    def test_bing_redirect(self):
+        out = WebSearcher._normalize_url("https://www.bing.com/ck/a?!&p=z&u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS8x&ntb=1")
+        assert out == "https://example.com/1"
+
+    def test_plain_url_unchanged(self):
+        assert WebSearcher._normalize_url("https://plain.example/x") == "https://plain.example/x"
+
+    def test_rejects_relative_and_anchor(self):
+        assert WebSearcher._normalize_url("/search?q=foo") is None
+        assert WebSearcher._normalize_url("#section") is None
+        assert WebSearcher._normalize_url(None) is None
 
 
 class TestSearchFallback:
-    """Test the search fallback mechanism."""
-    
+
     @pytest.fixture
     def searcher(self):
         return WebSearcher()
-    
+
     @pytest.fixture
     def sample_results(self):
-        return [
-            {
-                "title": "Test Result 1",
-                "url": "https://example.com/1", 
-                "domain": "example.com",
-                "snippet": "Test snippet",
-                "rank": 1,
-                "source_engine": "google"
-            }
-        ]
-    
+        return [{
+            "title": "R1", "url": "https://example.com/1", "domain": "example.com",
+            "snippet": "s", "rank": 1, "source_engine": "google",
+        }]
+
     def test_fallback_google_success(self, searcher, sample_results):
-        """Test fallback when Google succeeds."""
-        searcher.driver_initialized = True
-        searcher.driver = MagicMock()
-        
-        # Mock the method in the search_engines dictionary
-        mock_google_method = MagicMock(return_value=sample_results)
-        searcher.search_engines[0]['method'] = mock_google_method
-        
+        searcher.search_engines[0]['method'] = MagicMock(return_value=sample_results)
         results, engine_used = searcher.search_with_fallback("test", 10, True)
-        
         assert len(results) == 1
         assert engine_used == "google"
-        mock_google_method.assert_called_once_with("test", 10, True)
-    
+
     def test_fallback_google_fails_ddg_succeeds(self, searcher, sample_results):
-        """Test fallback when Google fails, DuckDuckGo succeeds."""
-        searcher.driver_initialized = True
-        searcher.driver = MagicMock()
-        
-        ddg_results = sample_results.copy()
-        for result in ddg_results:
-            result['source_engine'] = 'duckduckgo'
-        
-        # Mock the methods in the search_engines dictionary
-        mock_google_method = MagicMock(side_effect=Exception("Google blocked"))
-        mock_ddg_method = MagicMock(return_value=ddg_results)
-        searcher.search_engines[0]['method'] = mock_google_method
-        searcher.search_engines[1]['method'] = mock_ddg_method
-        
+        ddg = [{**r, 'source_engine': 'duckduckgo'} for r in sample_results]
+        searcher.search_engines[0]['method'] = MagicMock(side_effect=Exception("Google blocked"))
+        searcher.search_engines[1]['method'] = MagicMock(return_value=ddg)
         results, engine_used = searcher.search_with_fallback("test", 10, True)
-        
-        assert len(results) == 1
         assert engine_used == "duckduckgo"
         assert 'google' in searcher.blocked_engines
-        mock_google_method.assert_called_once_with("test", 10, True)
-        mock_ddg_method.assert_called_once_with("test", 10, True)
-    
+
     def test_fallback_all_engines_blocked(self, searcher):
-        """Test fallback when all engines are pre-blocked."""
-        searcher.driver_initialized = True
-        searcher.driver = MagicMock()
-        
-        # Pre-block all engines
-        searcher.blocked_engines.add('google')
-        searcher.blocked_engines.add('duckduckgo')
-        searcher.blocked_engines.add('bing')
-        
+        searcher.blocked_engines.update({'google', 'duckduckgo', 'bing'})
         results, engine_used = searcher.search_with_fallback("test", 10, True)
-        
         assert len(results) == 0
         assert engine_used == "none"
 
 
+# ---------------------------------------------------------------------------
+# Engine management & status
+# ---------------------------------------------------------------------------
+
 class TestEngineManagement:
-    """Test engine status and reset functionality."""
-    
+
     @pytest.fixture
     def searcher(self):
         return WebSearcher()
-    
-    def test_engine_status_tracking(self, searcher):
-        """Test engine status tracking."""
-        # Initially all available
+
+    def test_engine_status_includes_backend(self, searcher):
+        searcher.backend = make_backend()
+        searcher.backend.name = "obscura"
         status = searcher.get_engine_status()
-        assert all(s == 'available' for s in status.values())
-        
-        # Block some engines
+        assert status['backend'] == "obscura"
+        assert status['google'] == 'available'
+
+    def test_engine_status_tracking(self, searcher):
+        searcher.backend = make_backend()
         searcher.blocked_engines.add('google')
         status = searcher.get_engine_status()
         assert status['google'] == 'blocked'
         assert status['duckduckgo'] == 'available'
-    
+
     def test_reset_blocked_engines(self, searcher):
-        """Test resetting blocked engines."""
-        searcher.blocked_engines.add('google')
-        searcher.blocked_engines.add('bing')
-        
+        searcher.blocked_engines.update({'google', 'bing'})
         searcher.reset_blocked_engines()
-        
         assert len(searcher.blocked_engines) == 0
 
-
-class TestMCPTools:
-    """Test MCP tool functions."""
-    
-    @pytest.fixture
-    def sample_results(self):
-        return [
-            {
-                "title": "Test Result 1",
-                "url": "https://example.com/1",
-                "domain": "example.com", 
-                "snippet": "Test snippet",
-                "rank": 1,
-                "source_engine": "google"
-            }
-        ]
-    
-    @patch('main.get_searcher')
-    def test_search_functionality(self, mock_get_searcher, sample_results):
-        """Test the core search functionality used by MCP tools."""
-        mock_searcher = MagicMock()
-        mock_searcher.search_with_fallback.return_value = (sample_results, 'google')
-        mock_get_searcher.return_value = mock_searcher
-        
-        # Test the core search functionality
-        searcher = mock_get_searcher()
-        results, engine_used = searcher.search_with_fallback("test query", 5, True)
-        
-        assert len(results) == 1
-        assert engine_used == 'google'
-        mock_searcher.search_with_fallback.assert_called_once_with("test query", 5, True)
-    
-    @patch('main.get_searcher')
-    def test_engine_status_functionality(self, mock_get_searcher):
-        """Test the engine status functionality used by MCP tools."""
-        mock_searcher = MagicMock()
-        mock_searcher.get_engine_status.return_value = {
-            'google': 'available',
-            'duckduckgo': 'blocked',
-            'bing': 'available'
-        }
-        mock_get_searcher.return_value = mock_searcher
-        
-        # Test the core engine status functionality
-        searcher = mock_get_searcher()
-        status = searcher.get_engine_status()
-        
-        assert status['google'] == 'available'
-        assert status['duckduckgo'] == 'blocked'
+    def test_close_delegates_to_backend(self, searcher):
+        backend = make_backend()
+        searcher.backend = backend
+        searcher.close()
+        backend.close.assert_called_once()
 
 
-class TestIntegration:
-    """Integration tests for complete search workflows."""
-    
-    @pytest.fixture
-    def sample_results(self):
-        return [
-            {
-                "title": "Python Tutorial",
-                "url": "https://python.org/tutorial",
-                "domain": "python.org",
-                "snippet": "Learn Python programming",
-                "rank": 1,
-                "source_engine": "google"
-            }
-        ]
-    
-    @patch('main.WebSearcher._setup_driver')
-    def test_full_search_workflow_google_success(self, mock_setup, sample_results):
-        """Test complete search workflow when Google succeeds."""
-        searcher = WebSearcher()
-        mock_driver = MagicMock()
-        searcher.driver = mock_driver
-        searcher.driver_initialized = True
-        
-        # Mock successful Google search
-        with patch.object(searcher, '_parse_google_results', return_value=sample_results):
-            with patch.object(searcher, '_is_google_blocked', return_value=False):
-                results, engine_used = searcher.search_with_fallback("python programming", 5, True)
-        
-        assert len(results) == 1
-        assert engine_used == "google"
-        assert all(result['source_engine'] == 'google' for result in results)
-        assert 'google' not in searcher.blocked_engines
-    
-    def test_manual_engine_blocking(self):
-        """Test manual engine blocking and status."""
-        searcher = WebSearcher()
-        
-        # Manually block engines
-        searcher.blocked_engines.add('google')
-        searcher.blocked_engines.add('duckduckgo')
-        
-        status = searcher.get_engine_status()
-        assert status['google'] == 'blocked'
-        assert status['duckduckgo'] == 'blocked' 
-        assert status['bing'] == 'available'
-        
-        # Reset engines
-        searcher.reset_blocked_engines()
-        status = searcher.get_engine_status()
-        assert all(s == 'available' for s in status.values())
+# ---------------------------------------------------------------------------
+# Page content
+# ---------------------------------------------------------------------------
 
+class TestPageContent:
 
-class TestEdgeCases:
-    """Test edge cases and error handling."""
-    
     @pytest.fixture
     def searcher(self):
         return WebSearcher()
-    
+
+    def test_get_page_content(self, searcher):
+        html = "<html><head><title>My Page</title></head><body><script>x()</script><p>Hello world</p></body></html>"
+        searcher.backend = make_backend(html, title="My Page")
+        result = searcher.get_page_content("https://example.com", 5000)
+        assert result['title'] == "My Page"
+        assert "Hello world" in result['content']
+        assert "x()" not in result['content']  # script stripped
+
+    def test_get_page_content_handles_error(self, searcher):
+        backend = MagicMock()
+        backend.fetch_html.side_effect = Exception("boom")
+        searcher.backend = backend
+        result = searcher.get_page_content("https://example.com")
+        assert result['length'] == 0
+        assert "Error fetching content" in result['content']
+
+
+# ---------------------------------------------------------------------------
+# MCP tools
+# ---------------------------------------------------------------------------
+
+class TestMCPTools:
+
     @pytest.fixture
-    def mock_driver(self):
-        return MagicMock()
-    
-    def test_empty_search_query(self, searcher, mock_driver):
-        """Test search with empty query."""
-        searcher.driver = mock_driver
-        searcher.driver_initialized = True
-        
-        with patch.object(searcher, '_parse_google_results', return_value=[]):
-            results = searcher._search_google("", 10, True)
-        
-        assert len(results) == 0
-    
-    def test_selenium_timeout_exception(self, searcher, mock_driver):
-        """Test handling of Selenium timeout exceptions."""
-        searcher.driver = mock_driver
-        searcher.driver_initialized = True
-        mock_driver.get.side_effect = TimeoutException("Page load timeout")
-        
-        with pytest.raises(Exception):
-            searcher._search_google("test query", 10, True)
-    
-    def test_close_driver(self, searcher, mock_driver):
-        """Test closing the driver."""
-        searcher.driver = mock_driver
-        
-        searcher.close()
-        
-        mock_driver.quit.assert_called_once()
+    def sample_results(self):
+        return [{
+            "title": "R1", "url": "https://example.com/1", "domain": "example.com",
+            "snippet": "s", "rank": 1, "source_engine": "google",
+        }]
+
+    @patch('main.get_searcher')
+    def test_search_functionality(self, mock_get_searcher, sample_results):
+        mock_searcher = MagicMock()
+        mock_searcher.search_with_fallback.return_value = (sample_results, 'google')
+        mock_get_searcher.return_value = mock_searcher
+
+        searcher = mock_get_searcher()
+        results, engine_used = searcher.search_with_fallback("test query", 5, True)
+        assert len(results) == 1
+        assert engine_used == 'google'
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"]) 
+    pytest.main([__file__, "-v"])

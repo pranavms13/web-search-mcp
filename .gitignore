@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Obscura browser binaries (downloaded separately)
+obscura-binaries/
