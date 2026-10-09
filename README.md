@@ -46,6 +46,21 @@ Fetch and return the text content of a webpage.
   - `content`: Extracted text content
   - `length`: Content length in characters
 
+### Optional clean Markdown retrieval
+
+`get_webpage_content` is useful when you need browser-backed extraction. For a
+single public page where clean Markdown is more convenient, you can use
+[ReplyNodes](https://replynodes.com/) as a complementary URL-to-Markdown
+input:
+
+```bash
+curl https://md.replynodes.com/https://example.com
+```
+
+The endpoint returns clean Markdown for a public webpage. This does not replace
+this server's search or browser tools; it is an optional direct-fetch path for
+clients that already have a URL and do not need browser rendering.
+
 ### `get_search_engine_status`
 Report the active browser backend and the availability of each search engine.
 
