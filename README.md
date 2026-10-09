@@ -54,7 +54,7 @@ single public page where clean Markdown is more convenient, you can use
 input:
 
 ```bash
-curl https://md.replynodes.com/https://example.com
+curl -sS https://md.replynodes.com/stripe.com
 ```
 
 The endpoint returns clean Markdown for a public webpage. This does not replace
